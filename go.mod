@@ -1,4 +1,4 @@
-module github.com/mailgun/groupcache/v2
+module github.com/razer96/groupcache
 
 require (
 	github.com/golang/protobuf v1.3.1
