@@ -32,8 +32,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hashicorp/golang-lru"
 	pb "github.com/razer96/groupcache/groupcachepb"
-	"github.com/razer96/groupcache/lru"
 	"github.com/razer96/groupcache/singleflight"
 	"github.com/sirupsen/logrus"
 )
@@ -94,8 +94,8 @@ func GetGroup(name string) *Group {
 // completes.
 //
 // The group name must be unique for each getter.
-func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
-	return newGroup(name, cacheBytes, getter, nil)
+func NewGroup(name string, cacheSize int64, getter Getter) (*Group, error) {
+	return newGroup(name, cacheSize, getter, nil)
 }
 
 // DeregisterGroup removes group from group pool
@@ -106,7 +106,7 @@ func DeregisterGroup(name string) {
 }
 
 // If peers is nil, the peerPicker is called via a sync.Once to initialize it.
-func newGroup(name string, cacheBytes int64, getter Getter, peers PeerPicker) *Group {
+func newGroup(name string, cacheSize int64, getter Getter, peers PeerPicker) (*Group, error) {
 	if getter == nil {
 		panic("nil Getter")
 	}
@@ -120,7 +120,7 @@ func newGroup(name string, cacheBytes int64, getter Getter, peers PeerPicker) *G
 		name:        name,
 		getter:      getter,
 		peers:       peers,
-		cacheBytes:  cacheBytes,
+		cacheSize:   cacheSize,
 		loadGroup:   &singleflight.Group{},
 		setGroup:    &singleflight.Group{},
 		removeGroup: &singleflight.Group{},
@@ -129,7 +129,7 @@ func newGroup(name string, cacheBytes int64, getter Getter, peers PeerPicker) *G
 		fn(g)
 	}
 	groups[name] = g
-	return g
+	return g, nil
 }
 
 // newGroupHook, if non-nil, is called right after a new group is created.
@@ -162,11 +162,11 @@ func callInitPeerServer() {
 // A Group is a cache namespace and associated data loaded spread over
 // a group of 1 or more machines.
 type Group struct {
-	name       string
-	getter     Getter
-	peersOnce  sync.Once
-	peers      PeerPicker
-	cacheBytes int64 // limit for sum of mainCache and hotCache size
+	name      string
+	getter    Getter
+	peersOnce sync.Once
+	peers     PeerPicker
+	cacheSize int64 // limit for sum of mainCache and hotCache size
 
 	// mainCache is a cache of the keys for which this process
 	// (amongst its peers) is authoritative. That is, this cache
@@ -491,7 +491,7 @@ func (g *Group) removeFromPeer(ctx context.Context, peer ProtoGetter, key string
 }
 
 func (g *Group) lookupCache(key string) (value ByteView, ok bool) {
-	if g.cacheBytes <= 0 {
+	if g.cacheSize <= 0 {
 		return
 	}
 	value, ok = g.mainCache.get(key)
@@ -503,7 +503,7 @@ func (g *Group) lookupCache(key string) (value ByteView, ok bool) {
 }
 
 func (g *Group) localSet(key string, value []byte, expire time.Time, cache *cache) {
-	if g.cacheBytes <= 0 {
+	if g.cacheSize <= 0 {
 		return
 	}
 
@@ -520,7 +520,7 @@ func (g *Group) localSet(key string, value []byte, expire time.Time, cache *cach
 
 func (g *Group) localRemove(key string) {
 	// Clear key from our local cache
-	if g.cacheBytes <= 0 {
+	if g.cacheSize <= 0 {
 		return
 	}
 
@@ -532,7 +532,7 @@ func (g *Group) localRemove(key string) {
 }
 
 func (g *Group) populateCache(key string, value ByteView, cache *cache) {
-	if g.cacheBytes <= 0 {
+	if g.cacheSize <= 0 {
 		return
 	}
 	cache.add(key, value)
@@ -541,7 +541,7 @@ func (g *Group) populateCache(key string, value ByteView, cache *cache) {
 	for {
 		mainBytes := g.mainCache.bytes()
 		hotBytes := g.hotCache.bytes()
-		if mainBytes+hotBytes <= g.cacheBytes {
+		if mainBytes+hotBytes <= g.cacheSize {
 			return
 		}
 
@@ -587,48 +587,42 @@ func (g *Group) CacheStats(which CacheType) CacheStats {
 // values.
 type cache struct {
 	mu         sync.RWMutex
-	nbytes     int64 // of all keys and values
-	lru        *lru.Cache
+	c          *lru.TwoQueueCache
 	nhit, nget int64
-	nevict     int64 // number of evictions
+}
+
+func newCache(size int) (*cache, error) {
+	twoQ, err := lru.New2Q(size)
+	if err != nil {
+		return nil, err
+	}
+
+	return &cache{
+		c: twoQ,
+	}, nil
 }
 
 func (c *cache) stats() CacheStats {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return CacheStats{
-		Bytes:     c.nbytes,
-		Items:     c.itemsLocked(),
-		Gets:      c.nget,
-		Hits:      c.nhit,
-		Evictions: c.nevict,
+		Items: int64(c.c.Len()),
+		Gets:  c.nget,
+		Hits:  c.nhit,
 	}
 }
 
 func (c *cache) add(key string, value ByteView) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.lru == nil {
-		c.lru = &lru.Cache{
-			OnEvicted: func(key lru.Key, value interface{}) {
-				val := value.(ByteView)
-				c.nbytes -= int64(len(key.(string))) + int64(val.Len())
-				c.nevict++
-			},
-		}
-	}
-	c.lru.Add(key, value, value.Expire())
-	c.nbytes += int64(len(key)) + int64(value.Len())
+	c.c.Add(key, value)
 }
 
 func (c *cache) get(key string) (value ByteView, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.nget++
-	if c.lru == nil {
-		return
-	}
-	vi, ok := c.lru.Get(key)
+	vi, ok := c.c.Get(key)
 	if !ok {
 		return
 	}
@@ -637,39 +631,7 @@ func (c *cache) get(key string) (value ByteView, ok bool) {
 }
 
 func (c *cache) remove(key string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.lru == nil {
-		return
-	}
-	c.lru.Remove(key)
-}
-
-func (c *cache) removeOldest() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.lru != nil {
-		c.lru.RemoveOldest()
-	}
-}
-
-func (c *cache) bytes() int64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.nbytes
-}
-
-func (c *cache) items() int64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.itemsLocked()
-}
-
-func (c *cache) itemsLocked() int64 {
-	if c.lru == nil {
-		return 0
-	}
-	return int64(c.lru.Len())
+	c.c.Remove(key)
 }
 
 // An AtomicInt is an int64 to be accessed atomically.
@@ -696,9 +658,7 @@ func (i *AtomicInt) String() string {
 
 // CacheStats are returned by stats accessors on Group.
 type CacheStats struct {
-	Bytes     int64
-	Items     int64
-	Gets      int64
-	Hits      int64
-	Evictions int64
+	Items int64
+	Gets  int64
+	Hits  int64
 }

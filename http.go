@@ -46,7 +46,7 @@ type HTTPPool struct {
 	opts HTTPPoolOptions
 
 	mu          sync.Mutex // guards peers and httpGetters
-	peers       *consistenthash.Map
+	peers       *consistenthash.VNConsistentHash
 	httpGetters map[string]*httpGetter // keyed by e.g. "http://10.0.0.2:8008"
 }
 
@@ -109,27 +109,32 @@ func NewHTTPPoolOpts(self string, o *HTTPPoolOptions) *HTTPPool {
 	if p.opts.Replicas == 0 {
 		p.opts.Replicas = defaultReplicas
 	}
-	p.peers = consistenthash.New(p.opts.Replicas, p.opts.HashFn)
+	p.peers = consistenthash.NewCustomVNConsistentHash(p.opts.Replicas, p.opts.HashFn)
 
 	RegisterPeerPicker(func() PeerPicker { return p })
 	return p
 }
 
-// Set updates the pool's list of peers.
-// Each peer value should be a valid base URL,
-// for example "http://example.net:8000".
-func (p *HTTPPool) Set(peers ...string) {
+func (p *HTTPPool) AddPeer(peer string) {
+	p.peers.Add(peer)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.peers = consistenthash.New(p.opts.Replicas, p.opts.HashFn)
-	p.peers.Add(peers...)
-	p.httpGetters = make(map[string]*httpGetter, len(peers))
-	for _, peer := range peers {
-		p.httpGetters[peer] = &httpGetter{
-			getTransport: p.opts.Transport,
-			baseURL:      peer + p.opts.BasePath,
-		}
+	p.httpGetters[peer] = &httpGetter{
+		getTransport: p.opts.Transport,
+		baseURL:      peer + p.opts.BasePath,
 	}
+}
+
+func (p *HTTPPool) RemovePeer(peer string) {
+	p.peers.Remove(peer)
+	p.removeGetter(peer)
+}
+
+func (p *HTTPPool) removeGetter(peer string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	delete(p.httpGetters, peer)
 }
 
 // GetAll returns all the peers in the pool
@@ -147,12 +152,14 @@ func (p *HTTPPool) GetAll() []ProtoGetter {
 }
 
 func (p *HTTPPool) PickPeer(key string) (ProtoGetter, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.peers.IsEmpty() {
 		return nil, false
 	}
-	if peer := p.peers.Get(key); peer != p.self {
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if peer, _ := p.peers.Get(key); peer != p.self {
 		return p.httpGetters[peer], true
 	}
 	return nil, false
@@ -254,8 +261,8 @@ type httpGetter struct {
 	baseURL      string
 }
 
-func (p *httpGetter) GetURL() string {
-	return p.baseURL
+func (h *httpGetter) GetURL() string {
+	return h.baseURL
 }
 
 var bufferPool = sync.Pool{
